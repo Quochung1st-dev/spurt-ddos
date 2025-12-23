@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -50,9 +52,11 @@ var (
 	sleepDuration   time.Duration
 	cookie          string
 	useCookie       bool
-	c               = &http.Client{
-		Timeout: timeoutDuration,
-	}
+	c               *http.Client
+	useProxy        bool
+	proxyFile       string
+	clients         []*http.Client
+	rrIndex         uint32
 )
 
 func colourise(colour, s string) string {
@@ -114,6 +118,52 @@ func fetchIP() {
 	fmt.Printf("\n%s\n", body)
 }
 
+func readProxies(path string) (list []string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		if !strings.Contains(line, ":") {
+			continue
+		}
+		list = append(list, line)
+	}
+	if sc.Err() != nil {
+		return nil, sc.Err()
+	}
+	return list, nil
+}
+
+func buildClientWithProxy(addr string) *http.Client {
+	p := addr
+	if !strings.HasPrefix(addr, "http://") && !strings.HasPrefix(addr, "https://") {
+		p = "http://" + addr
+	}
+	u, err := url.Parse(p)
+	if err != nil {
+		return &http.Client{Timeout: timeoutDuration}
+	}
+	tr := &http.Transport{
+		Proxy: http.ProxyURL(u),
+	}
+	return &http.Client{Transport: tr, Timeout: timeoutDuration}
+}
+
+func chooseClient() *http.Client {
+	if len(clients) == 0 {
+		return c
+	}
+	i := atomic.AddUint32(&rrIndex, 1)
+	return clients[int(i)%len(clients)]
+}
+
 func get() {
 	req, err := http.NewRequest("GET", target+paramJoiner+buildblock(rand.Intn(7)+3)+"="+buildblock(rand.Intn(7)+3), nil)
 	if err != nil {
@@ -131,7 +181,8 @@ func get() {
 		req.Header.Set("Cookie", cookie)
 	}
 
-	resp, err := c.Do(req)
+	client := chooseClient()
+	resp, err := client.Do(req)
 
 	atomic.AddUint64(&reqCount, 1) // Increment number of requests sent
 
@@ -168,6 +219,8 @@ func main() {
 	flag.IntVar(&threads, "threads", 1, "Number of threads.")
 	flag.BoolVar(&checkIP, "check", false, "Enable IP address check.")
 	flag.StringVar(&cookie, "cookie", "", "Cookie to use for requests.")
+	flag.BoolVar(&useProxy, "proxies", false, "Enable proxies from file.")
+	flag.StringVar(&proxyFile, "proxy-file", "proxies.txt", "Proxy list file path.")
 	flag.Parse()
 
 	if checkIP {
@@ -197,6 +250,22 @@ func main() {
 	// Convert values to milliseconds
 	timeoutDuration = time.Duration(timeout) * time.Millisecond
 	sleepDuration = time.Duration(sleep) * time.Millisecond
+	c = &http.Client{Timeout: timeoutDuration}
+
+	if useProxy {
+		path := proxyFile
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(".", path)
+		}
+		ps, err := readProxies(path)
+		if err != nil {
+			fmt.Println(err)
+		} else {
+			for _, p := range ps {
+				clients = append(clients, buildClientWithProxy(p))
+			}
+		}
+	}
 
 	if strings.ContainsRune(target, '?') {
 		paramJoiner = "&"
